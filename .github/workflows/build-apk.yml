@@ -1,39 +1,93 @@
-name: Build APK
+name: Build OfflineLink APK from ZIP
 
 on:
   push:
     branches: [main, master]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: offlinelink-zip-build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
+    name: Extract source ZIP and build APK
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-      - name: Unzip the project
+      - name: Find and extract uploaded project ZIP
+        id: project
+        shell: bash
         run: |
-          ZIP=$(ls *.zip | head -n 1)
-          echo "Using $ZIP"
-          unzip -q "$ZIP" -d project
-          SETTINGS=$(find project -name settings.gradle.kts | head -n 1)
-          echo "PROJECT_DIR=$(dirname "$SETTINGS")" >> "$GITHUB_ENV"
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/offlinelink-source"
 
-      - uses: actions/setup-java@v4
+          ZIP_FILE=""
+          if [[ -f "OfflineLink-Fixed-GitHub-Build.zip" ]]; then
+            ZIP_FILE="OfflineLink-Fixed-GitHub-Build.zip"
+          else
+            mapfile -t ZIP_FILES < <(find . -maxdepth 1 -type f -iname '*.zip' -print | sort)
+            if [[ "${#ZIP_FILES[@]}" -eq 1 ]]; then
+              ZIP_FILE="${ZIP_FILES[0]}"
+            elif [[ "${#ZIP_FILES[@]}" -eq 0 ]]; then
+              echo "No project ZIP found in the repository root. Upload OfflineLink-Fixed-GitHub-Build.zip to the repository root."
+              exit 1
+            else
+              echo "More than one ZIP was found in the repository root. Keep only the intended project ZIP or name it OfflineLink-Fixed-GitHub-Build.zip."
+              printf '%s\n' "${ZIP_FILES[@]}"
+              exit 1
+            fi
+          fi
+
+          echo "Extracting: $ZIP_FILE"
+          unzip -q "$ZIP_FILE" -d "$RUNNER_TEMP/offlinelink-source"
+
+          SETTINGS_FILE="$(find "$RUNNER_TEMP/offlinelink-source" -type f -name settings.gradle.kts -not -path '*/.gradle/*' -print -quit)"
+          if [[ -z "$SETTINGS_FILE" ]]; then
+            echo "Could not find settings.gradle.kts inside $ZIP_FILE."
+            find "$RUNNER_TEMP/offlinelink-source" -maxdepth 5 -type f -print
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
+          if [[ ! -f "$PROJECT_DIR/app/build.gradle.kts" ]]; then
+            echo "Found settings.gradle.kts, but app/build.gradle.kts is missing from $PROJECT_DIR."
+            exit 1
+          fi
+
+          echo "dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "Android project extracted to: $PROJECT_DIR"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          java-version: '17'
 
-      - uses: gradle/actions/setup-gradle@v4
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.9
+          gradle-version: '8.9'
 
       - name: Build debug APK
-        run: |
-          cd "$PROJECT_DIR"
-          gradle assembleDebug --no-daemon
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: gradle --no-daemon --stacktrace --warning-mode all assembleDebug
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
         with:
           name: OfflineLink-debug-apk
-          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/app-debug.apk
+          path: ${{ steps.project.outputs.dir }}/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+          
